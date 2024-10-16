@@ -13,9 +13,9 @@
 class Check < ApplicationRecord
   has_many :status_changes, dependent: :destroy
 
-  after_create :create_job, if: :active?
+  after_create :create_job, :create_tls_job, if: :active?
   after_update :update_routine
-  after_destroy :unschedule_job, if: :active?
+  after_destroy :unschedule_job, :unschedule_tls_job, if: :active?
 
   validates :name, presence: true
   validates :url, presence: true
@@ -25,14 +25,14 @@ class Check < ApplicationRecord
 
   scope :active, -> { where(active: true) }
   scope :inactive, -> { where(active: false) }
-  scope :healthy, -> { where('status LIKE ? AND active = ?', '2%', true) }
-  scope :unhealthy, -> { where.not('status LIKE ? AND active = ?', '2%', true) }
-  scope :status_1xx, -> { where('status LIKE ? AND active = ?', '1%', true) }
-  scope :status_2xx, -> { where('status LIKE ? AND active = ?', '2%', true) }
-  scope :status_3xx, -> { where('status LIKE ? AND active = ?', '3%', true) }
-  scope :status_4xx, -> { where('status LIKE ? AND active = ?', '4%', true) }
-  scope :status_5xx, -> { where('status LIKE ? AND active = ?', '5%', true) }
-  scope :status_err, -> { where('NOT (status LIKE ? OR status LIKE ? OR status LIKE ? OR status LIKE ? OR status LIKE ?) AND active = ?', '1%', '2%', '3%', '4%', '5%', true) }
+  scope :healthy, -> { where("status LIKE ? AND active = ?", "2%", true) }
+  scope :unhealthy, -> { where.not("status LIKE ? AND active = ?", "2%", true) }
+  scope :status_1xx, -> { where("status LIKE ? AND active = ?", "1%", true) }
+  scope :status_2xx, -> { where("status LIKE ? AND active = ?", "2%", true) }
+  scope :status_3xx, -> { where("status LIKE ? AND active = ?", "3%", true) }
+  scope :status_4xx, -> { where("status LIKE ? AND active = ?", "4%", true) }
+  scope :status_5xx, -> { where("status LIKE ? AND active = ?", "5%", true) }
+  scope :status_err, -> { where("NOT (status LIKE ? OR status LIKE ? OR status LIKE ? OR status LIKE ? OR status LIKE ?) AND active = ?", "1%", "2%", "3%", "4%", "5%", true) }
 
   def self.percentage_active
     if !active.empty?
@@ -63,7 +63,7 @@ class Check < ApplicationRecord
         status = http_code unless e
         last_contact_at = Time.current
         Rails.logger.info "ciao-scheduler Checked '#{url}' at '#{last_contact_at}' and got '#{status}'"
-        status_before = status_after = ''
+        status_before = status_after = ""
         ActiveRecord::Base.connection_pool.with_connection do
           status_before = self.status
           update_columns(status: status, last_contact_at: last_contact_at, next_contact_at: job.next_times(1).first.to_local_time)
@@ -89,18 +89,80 @@ class Check < ApplicationRecord
       Rails.logger.info "ciao-scheduler Created job '#{job.id}'"
       update_columns(job: job.id, next_contact_at: job.next_times(1).first.to_local_time)
     else
-      Rails.logger.error 'ciao-scheduler Could not create job'
+      Rails.logger.error "ciao-scheduler Could not create job"
     end
     job
   end
 
   def unschedule_job
     job = Rufus::Scheduler.singleton.job(self.job)
+
     if job
       job.unschedule
       Rails.logger.info "ciao-scheduler Unscheduled job '#{job.id}'"
     else
       Rails.logger.info "ciao-scheduler Could not unschedule job: '#{self.job}' not found"
+    end
+  end
+
+  # rubocop:disable Metrics/MethodLength
+  # rubocop:disable Metrics/AbcSize
+  def create_tls_job
+    uri = URI.parse(url)
+    return unless uri.scheme == "https"
+
+    tls_job =
+      Rufus::Scheduler.singleton.cron "0 12 * * *", job: true do
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+        tls_expires_at = nil
+        begin
+          http.start do |h|
+            tls_expires_at = h.peer_cert.not_after
+          end
+        rescue *NET_HTTP_ERRORS => e
+          tls_expires_error = e.to_s.tr('"', "'")
+        end
+        if tls_expires_error
+          Rails.logger.info "ciao-scheduler Checked TLS certificate of '#{url}' and got '#{tls_expires_error}'"
+        else
+          Rails.logger.info "ciao-scheduler Checked TLS certificate of '#{url}' and got '#{tls_expires_at}'"
+          tls_expires_in_days = (tls_expires_at - Time.now).to_i / (24 * 60 * 60)
+          ActiveRecord::Base.connection_pool.with_connection do
+            update_columns(tls_expires_at: tls_expires_at, tls_expires_in_days: tls_expires_in_days)
+          end
+
+          if tls_expires_in_days < 30
+            NOTIFICATIONS_TLS_EXPIRES.each do |notification|
+              notification.notify(
+                name: name,
+                url: url,
+                check_url: Rails.application.routes.url_helpers.check_path(self),
+                tls_expires_at: tls_expires_at,
+                tls_expires_in_days: tls_expires_in_days
+              )
+            end
+          end
+        end
+      end
+    if tls_job
+      Rails.logger.info "ciao-scheduler Created tls_job '#{tls_job.id}'"
+      update_columns(tls_job: tls_job.id)
+    else
+      Rails.logger.error "ciao-scheduler Could not create tls_job"
+    end
+    tls_job
+  end
+
+  def unschedule_tls_job
+    tls_job = Rufus::Scheduler.singleton.job(self.tls_job)
+
+    if tls_job
+      tls_job.unschedule
+      Rails.logger.info "ciao-scheduler Unscheduled tls_job '#{tls_job.id}'"
+    else
+      Rails.logger.info "ciao-scheduler Could not unschedule tls_job: '#{self.tls_job}' not found"
     end
   end
 
@@ -110,14 +172,18 @@ class Check < ApplicationRecord
     if saved_change_to_attribute?(:active)
       if active
         create_job
+        create_tls_job
       else
         unschedule_job
-        update_columns(next_contact_at: nil, job: nil)
+        unschedule_tls_job
+        update_columns(next_contact_at: nil, job: nil, tls_job: nil)
       end
     elsif saved_change_to_attribute?(:cron) || saved_change_to_attribute?(:url)
-      Rails.logger.info "ciao-scheduler Check '#{name}' updates to cron or URL triggered job update"
+      Rails.logger.info "ciao-scheduler Check '#{name}' updates to cron or URL triggered job and tls_job update"
       unschedule_job
-      create_job
+      unschedule_tls_job
+      create_job if active?
+      create_tls_job if active?
     end
   end
 end

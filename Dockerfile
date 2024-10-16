@@ -1,4 +1,4 @@
-FROM ruby:3.1.3-alpine
+FROM ruby:3.3.0-alpine3.18
 
 # for postgres: postgresql-dev
 RUN apk add --no-cache \
@@ -17,6 +17,7 @@ RUN set -x \
         build-base \
         libxml2-dev \
         libxslt-dev \
+        git \
     && gem install bundler \
 		&& bundle config set --local without 'development:test' \
     && bundle install --jobs 20 -j"$(nproc)" --retry 3 \
